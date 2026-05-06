@@ -12,12 +12,15 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
+import socket
 import sys
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 from markdownify import markdownify
 from reader import (
@@ -27,6 +30,37 @@ from reader import (
     FeedNotFoundError,
     TagNotFoundError,
 )
+
+
+class UnsafeURL(ValueError):
+    pass
+
+
+def check_url(url: str) -> None:
+    """Reject malformed URLs and any host that resolves to a non-public address.
+
+    Guards against SSRF: localhost, RFC1918, link-local (incl. cloud metadata
+    169.254.169.254), multicast, and reserved ranges.
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError as e:
+        raise UnsafeURL(f"invalid url: {url}") from e
+    if parsed.scheme not in ("http", "https"):
+        raise UnsafeURL(f"unsupported scheme: {parsed.scheme!r}")
+    host = parsed.hostname
+    if not host:
+        raise UnsafeURL(f"missing host in url: {url}")
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as e:
+        raise UnsafeURL(f"could not resolve host: {host}") from e
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_multicast or ip.is_reserved or ip.is_unspecified
+                or not ip.is_global):
+            raise UnsafeURL(f"refusing non-public address: {host} ({ip})")
 
 
 @contextmanager
@@ -50,6 +84,11 @@ def _emit(args, text: str, data: dict | list) -> None:
 
 def cmd_feed_add(args) -> int:
     url = args.url
+    try:
+        check_url(url)
+    except UnsafeURL as e:
+        sys.stderr.write(f"error: {e}\n")
+        return 2
     with _open_reader(args) as reader:
         try:
             reader.add_feed(url)
@@ -156,6 +195,17 @@ def _update_once(args) -> tuple[dict, int]:
         results = []
         any_error = False
         for url in feed_urls:
+            try:
+                check_url(url)
+            except UnsafeURL as e:
+                any_error = True
+                results.append({
+                    "url": url,
+                    "title": "",
+                    "new": 0,
+                    "error": str(e),
+                })
+                continue
             before = reader.get_entry_counts(feed=url).total
             list(reader.update_feeds_iter(feed=url))
             after = reader.get_entry_counts(feed=url).total

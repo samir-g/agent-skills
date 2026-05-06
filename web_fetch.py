@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import re
+import socket
 import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -35,6 +37,39 @@ USER_AGENT = (
 )
 SPA_MIN_TEXT = 500
 STRIP_TAGS = ("script", "style", "nav", "footer", "header", "aside", "form")
+MAX_REDIRECTS = 10
+
+
+class UnsafeURL(ValueError):
+    pass
+
+
+def check_url(url: str) -> None:
+    """Reject malformed URLs and any host that resolves to a non-public address.
+
+    Guards against SSRF: localhost, RFC1918, link-local (incl. cloud metadata
+    169.254.169.254), multicast, and reserved ranges. Re-run on every redirect
+    hop, since the original URL passing does not imply the redirect target does.
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError as e:
+        raise UnsafeURL(f"invalid url: {url}") from e
+    if parsed.scheme not in ("http", "https"):
+        raise UnsafeURL(f"unsupported scheme: {parsed.scheme!r}")
+    host = parsed.hostname
+    if not host:
+        raise UnsafeURL(f"missing host in url: {url}")
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as e:
+        raise UnsafeURL(f"could not resolve host: {host}") from e
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_multicast or ip.is_reserved or ip.is_unspecified
+                or not ip.is_global):
+            raise UnsafeURL(f"refusing non-public address: {host} ({ip})")
 
 
 @dataclass
@@ -98,17 +133,30 @@ def looks_like_spa(html: str, text: str) -> bool:
 
 
 def fetch_requests(url: str, timeout: int) -> tuple[str, str, int]:
-    resp = requests.get(
-        url,
-        headers={"User-Agent": USER_AGENT, "Accept": "text/html,*/*;q=0.8"},
-        timeout=timeout,
-        allow_redirects=True,
-    )
-    resp.encoding = resp.apparent_encoding or resp.encoding
-    return resp.text, resp.url, resp.status_code
+    session = requests.Session()
+    current = url
+    for _ in range(MAX_REDIRECTS):
+        check_url(current)
+        resp = session.get(
+            current,
+            headers={"User-Agent": USER_AGENT, "Accept": "text/html,*/*;q=0.8"},
+            timeout=timeout,
+            allow_redirects=False,
+        )
+        if resp.is_redirect or resp.is_permanent_redirect:
+            location = resp.headers.get("Location")
+            resp.close()
+            if not location:
+                break
+            current = urljoin(current, location)
+            continue
+        resp.encoding = resp.apparent_encoding or resp.encoding
+        return resp.text, resp.url, resp.status_code
+    raise requests.TooManyRedirects(f"too many redirects starting at {url}")
 
 
 def fetch_playwright(url: str, timeout: int) -> tuple[str, str, int]:
+    check_url(url)
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -132,6 +180,16 @@ def fetch_playwright(url: str, timeout: int) -> tuple[str, str, int]:
         try:
             ctx = browser.new_context(user_agent=USER_AGENT)
             page = ctx.new_page()
+
+            def _route_guard(route):
+                try:
+                    check_url(route.request.url)
+                except UnsafeURL:
+                    route.abort()
+                    return
+                route.continue_()
+
+            page.route("**/*", _route_guard)
             resp = page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
             html = page.content()
             final_url = page.url
@@ -241,14 +299,6 @@ def render_markdown(r: FetchResult) -> str:
     return header + r.markdown
 
 
-def valid_url(url: str) -> bool:
-    try:
-        parsed = urlparse(url)
-        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
-    except ValueError:
-        return False
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Fetch and analyse website content."
@@ -260,8 +310,10 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=30, help="Timeout seconds")
     args = parser.parse_args()
 
-    if not valid_url(args.url):
-        print(f"invalid url: {args.url}", file=sys.stderr)
+    try:
+        check_url(args.url)
+    except UnsafeURL as e:
+        print(f"error: {e}", file=sys.stderr)
         return 2
 
     result: FetchResult | None = None
@@ -271,6 +323,9 @@ def main() -> int:
     if result is None:
         try:
             result = fetch(args.url, args.timeout, args.render)
+        except UnsafeURL as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
         except requests.RequestException as e:
             print(f"fetch failed: {e}", file=sys.stderr)
             return 1
