@@ -38,6 +38,7 @@ USER_AGENT = (
 SPA_MIN_TEXT = 500
 STRIP_TAGS = ("script", "style", "nav", "footer", "header", "aside", "form")
 MAX_REDIRECTS = 10
+MAX_BYTES = 10 * 1024 * 1024
 
 
 class UnsafeURL(ValueError):
@@ -142,6 +143,7 @@ def fetch_requests(url: str, timeout: int) -> tuple[str, str, int]:
             headers={"User-Agent": USER_AGENT, "Accept": "text/html,*/*;q=0.8"},
             timeout=timeout,
             allow_redirects=False,
+            stream=True,
         )
         if resp.is_redirect or resp.is_permanent_redirect:
             location = resp.headers.get("Location")
@@ -150,6 +152,20 @@ def fetch_requests(url: str, timeout: int) -> tuple[str, str, int]:
                 break
             current = urljoin(current, location)
             continue
+        cl = resp.headers.get("Content-Length")
+        if cl and cl.isdigit() and int(cl) > MAX_BYTES:
+            resp.close()
+            raise ValueError(f"response too large: {cl} bytes (cap {MAX_BYTES})")
+        chunks: list[bytes] = []
+        size = 0
+        for chunk in resp.iter_content(8192):
+            size += len(chunk)
+            if size > MAX_BYTES:
+                resp.close()
+                raise ValueError(f"response exceeded cap of {MAX_BYTES} bytes")
+            chunks.append(chunk)
+        # Hand the bounded body back to requests so .text/.apparent_encoding work.
+        resp._content = b"".join(chunks)
         resp.encoding = resp.apparent_encoding or resp.encoding
         return resp.text, resp.url, resp.status_code
     raise requests.TooManyRedirects(f"too many redirects starting at {url}")
