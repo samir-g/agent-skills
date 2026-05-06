@@ -54,6 +54,16 @@ If the docs disagree with the spec's assumptions, stop and surface the conflict 
 
 This task is research only.
 
+### Findings (recorded post-execution)
+
+- **Required `plugin.json` fields:** only `name`. Recommended optional: `description`, `version`, `author` (object: `{ "name": "...", "email": "..." }`), `homepage`, `repository`, `license`, `keywords`. Omitting `version` falls back to git commit SHA.
+- **Skills layout:** `skills/<skill-name>/SKILL.md` relative to plugin root, as assumed.
+- **`SKILL.md` frontmatter:** `name` (optional, defaults to dir name), `description`, optional `disable-model-invocation`. Identical to standalone skills.
+- **`${CLAUDE_PLUGIN_ROOT}`:** canonical, resolves to the plugin's installation dir. Use double quotes around the expanded path (single quotes prevent expansion).
+- **Install path:** there is **no** `claude plugin install <path>` command. For local development: `claude --plugin-dir ./agent-skills` (per-session flag). For persistent install of a local plugin: convert to a marketplace and use `/plugin marketplace add ./agent-skills` then `/plugin install`. The `~/.claude/plugins/` directory exists but is undocumented for manual placement.
+
+This means the spec's draft README install line (`claude plugin install <path>`) is wrong. Tasks 7 and 9 use the corrected commands below.
+
 ---
 
 ## Task 2: Move scripts into skill directories
@@ -336,14 +346,17 @@ A Claude Code plugin bundling personal agent skills.
 
 ## Install
 
-Clone the repo and install as a Claude Code plugin:
+Clone the repo, then load it via Claude Code's `--plugin-dir` flag:
 
     git clone <repo-url> agent-skills
-    claude plugin install ./agent-skills
+    claude --plugin-dir ./agent-skills
 
-Or symlink into `~/.claude/plugins/`:
+Skills will appear as `/agent-skills:web-fetch` and `/agent-skills:rss-monitor`. Run `/reload-plugins` in Claude Code after editing skill content.
 
-    ln -s "$(pwd)/agent-skills" ~/.claude/plugins/agent-skills
+For persistent loading without the per-session flag, convert the repo into a marketplace (out of scope for this plan) and add it via:
+
+    /plugin marketplace add ./agent-skills
+    /plugin install agent-skills@<marketplace-name>
 
 ## Requirements
 
@@ -411,34 +424,30 @@ Expected: commit succeeds, two files added.
 **Files:**
 - No file changes; runtime verification only.
 
-- [ ] **Step 1: Install the plugin locally**
+- [ ] **Step 1: Verify directory structure on disk**
 
-From the repo root:
+The repo IS the plugin — no install copy step exists for local plugins (per Task 1 findings). Verify the layout:
 
-    claude plugin install .
+    ls .claude-plugin/plugin.json
+    ls skills/web-fetch/SKILL.md skills/web-fetch/web_fetch.py
+    ls skills/rss-monitor/SKILL.md skills/rss-monitor/rss_monitor.py
+    python3 -m json.tool .claude-plugin/plugin.json > /dev/null && echo "manifest OK"
 
-Expected: success message naming `agent-skills`. If the command differs per Task 1, use the documented form.
+Expected: all paths exist and the manifest validates as JSON.
 
-If install fails, surface the exact error to the user before proceeding — do not edit files speculatively.
+- [ ] **Step 2: Smoke-test both scripts via the SKILL.md invocation recipe**
 
-- [ ] **Step 2: Verify the install on disk**
+Simulate what Claude would run by setting `CLAUDE_PLUGIN_ROOT` to the repo root:
 
-Run:
+    export CLAUDE_PLUGIN_ROOT="$(pwd)"
+    uv run "${CLAUDE_PLUGIN_ROOT}/skills/web-fetch/web_fetch.py" https://example.com | head -20
+    uv run "${CLAUDE_PLUGIN_ROOT}/skills/rss-monitor/rss_monitor.py" feed list
 
-    ls -la ~/.claude/plugins/ | grep -i agent-skills
-    find ~/.claude/plugins -maxdepth 4 -name SKILL.md 2>/dev/null | grep agent-skills
+Expected: web-fetch prints example.com as markdown; rss-monitor prints `(no feeds)` or the existing feed list.
 
-Expected: the plugin directory (or symlink) is present, and both SKILL.md files are reachable. Exact path will depend on what the install command did — adjust the `find` command if Task 1 documented a different layout.
+- [ ] **Step 3: Confirm to the user that they can load the plugin**
 
-- [ ] **Step 3: Smoke-test both scripts directly through the recipe**
-
-Run the same command Claude would run via the SKILL.md (substituting the actual plugin root):
-
-    PLUGIN_ROOT="$(find ~/.claude/plugins -maxdepth 4 -type d -name agent-skills | head -1)"
-    uv run "$PLUGIN_ROOT/skills/web-fetch/web_fetch.py" https://example.com | head -20
-    uv run "$PLUGIN_ROOT/skills/rss-monitor/rss_monitor.py" feed list
-
-Expected: web-fetch prints the example.com markdown; rss-monitor prints `(no feeds)` (or the user's existing feed list). If `$PLUGIN_ROOT` resolves to the source clone (because of a symlink install), that's fine — the same scripts run.
+Tell the user: to test inside Claude Code, run `claude --plugin-dir <repo-path>` from a new terminal (per Task 1 findings). The skills should be available as `/agent-skills:web-fetch` and `/agent-skills:rss-monitor`. We can't trigger this from inside the current session — it's a session-launch flag.
 
 - [ ] **Step 4: No commit**
 
