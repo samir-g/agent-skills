@@ -107,7 +107,7 @@ def load_cache(url: str) -> FetchResult | None:
         result = FetchResult(**data)
         result.cached = True
         return result
-    except (json.JSONDecodeError, KeyError, ValueError):
+    except (json.JSONDecodeError, KeyError, ValueError, TypeError):
         return None
 
 
