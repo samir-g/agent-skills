@@ -1,0 +1,6 @@
+{
+  "name": "agent-skills",
+  "version": "0.1.0",
+  "description": "Personal agent skills for fetching web pages and monitoring RSS feeds.",
+  "author": { "name": "Samir" }
+}
