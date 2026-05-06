@@ -267,8 +267,12 @@ def cmd_poll(args) -> int:
 
 
 def entry_hash(feed_url: str, entry_id: str) -> str:
+    # 16 hex chars = 64 bits. The previous 10-char (40-bit) form was
+    # vulnerable to collision-driven entry confusion: a malicious feed
+    # could craft an entry_id whose hash prefix matched a target entry,
+    # and _resolve_hashes returns the first match it finds.
     raw = f"{feed_url}\x00{entry_id}".encode("utf-8")
-    return hashlib.sha1(raw).hexdigest()[:10]
+    return hashlib.sha256(raw).hexdigest()[:16]
 
 
 def _entry_to_dict(reader: Reader, entry, include_content: bool = False) -> dict:
