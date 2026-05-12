@@ -29,7 +29,6 @@ from halo import Halo
 
 
 DEFAULT_STATE_FILE_NAME = "inbox_monitor.json"
-SEEN_UID_RETENTION = 500
 
 DEFAULT_FEED_KEYWORDS = [
     "google alerts", "news", "newsletter", "substack",
@@ -192,7 +191,7 @@ def _classify(subject: str, sender: str, keywords: list[str]) -> str:
 
 
 def _fetch_new_messages(*, env: dict, host: str, port: int, mailbox: str,
-                        scan_limit: int, last_uid: int, seen_uids: set,
+                        scan_limit: int, last_uid: int,
                         keywords: list[str], since_date: str | None,
                         apply_dedup: bool) -> tuple:
     addr = _env_get(env, "ASSISTANT_EMAIL_ADDRESS")
@@ -218,7 +217,7 @@ def _fetch_new_messages(*, env: dict, host: str, port: int, mailbox: str,
             uid_int = int(uid)
             if uid_int > max_uid:
                 max_uid = uid_int
-            if apply_dedup and (uid_int <= last_uid or uid_int in seen_uids):
+            if apply_dedup and uid_int <= last_uid:
                 continue
             status, msg_data = mail.uid("fetch", uid, "(RFC822)")
             if status != "OK" or not msg_data or not msg_data[0]:
@@ -235,7 +234,6 @@ def _fetch_new_messages(*, env: dict, host: str, port: int, mailbox: str,
                 "date": date,
                 "type": _classify(subject, sender, keywords),
             })
-            seen_uids.add(uid_int)
         return out, max_uid
     finally:
         try:
@@ -263,7 +261,7 @@ def _render(messages: list) -> str:
 
 
 def _build_state(prev: dict, *, messages: list, last_uid: int,
-                 seen_uids: list, error) -> dict:
+                 error) -> dict:
     now = _now_iso()
     feeds = sum(1 for m in messages if m["type"] == "feed")
     other = sum(1 for m in messages if m["type"] != "feed")
@@ -280,7 +278,6 @@ def _build_state(prev: dict, *, messages: list, last_uid: int,
         "feedMessageCount": feeds,
         "otherMessageCount": other,
         "lastUid": last_uid,
-        "seenUids": seen_uids,
     }
     if error is None:
         state["previousSuccess"] = prev.get("lastSuccess")
@@ -315,7 +312,6 @@ def cmd_update(args) -> int:
 
     prev = _load_state(args.state)
     last_uid = int(prev.get("lastUid", 0))
-    seen_uids = {int(u) for u in prev.get("seenUids", [])}
 
     apply_dedup = True
     write_state = True
@@ -352,7 +348,7 @@ def cmd_update(args) -> int:
         messages, max_uid = _fetch_new_messages(
             env=env, host=host, port=port, mailbox=mailbox,
             scan_limit=scan_limit, last_uid=last_uid,
-            seen_uids=seen_uids, keywords=keywords,
+            keywords=keywords,
             since_date=since_date, apply_dedup=apply_dedup,
         )
     except (imaplib.IMAP4.error, OSError, RuntimeError) as e:
@@ -360,9 +356,8 @@ def cmd_update(args) -> int:
     finally:
         spinner.stop()
 
-    seen_list = sorted(seen_uids)[-SEEN_UID_RETENTION:]
     state = _build_state(prev, messages=messages, last_uid=max_uid,
-                         seen_uids=seen_list, error=error)
+                         error=error)
 
     if not args.dry_run and write_state:
         _save_state(args.state, state)

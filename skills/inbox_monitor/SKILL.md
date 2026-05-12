@@ -57,14 +57,13 @@ Written on every run to `<statePath>/inbox_monitor.json`. Standard keys plus ski
 - `status` (`Healthy` / `Attention`), `materialChange`, `notes`
 - `newMessageCount`, `feedMessageCount`, `otherMessageCount`
 - `lastUid` — highest IMAP UID seen so far
-- `seenUids` — rolling window of recently-seen UIDs (last 500)
 
 `previousSuccess` snapshots the prior `lastSuccess` on each successful run, so downstream consumers can ask "what landed since last run."
 
 ## Behaviour
 
 - Uses IMAP `SEARCH SINCE <date>` to restrict the server-side scan to the relevant window (date-of-`lastSuccess` minus one day for timezone margin). UID dedup still runs on top of the result to be precise.
-- Dedupes by IMAP UID against `lastUid` and `seenUids`. Re-running with no new mail is a no-op apart from the `lastRun` timestamp.
+- Dedupes by IMAP UID against `lastUid` (the monotonic high-water mark). Re-running with no new mail is a no-op apart from the `lastRun` timestamp.
 - SSRF guard rejects `imapHost` values that resolve to private/loopback/link-local addresses.
 - Only `ASSISTANT_EMAIL_ADDRESS` / `ASSISTANT_EMAIL_APP_PASSWORD` are read from env. IMAP host/port live in the config (single source of truth).
 - Exit `0` on success, `2` on failure (config error, missing env, IMAP error). Errors land on stderr; in `--json` mode the state JSON is emitted to stderr on failure so stdout stays clean.
