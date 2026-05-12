@@ -57,8 +57,22 @@ Written on every run to `<statePath>/inbox_monitor.json`. Standard keys plus ski
 - `status` (`Healthy` / `Attention`), `materialChange`, `notes`
 - `newMessageCount`, `feedMessageCount`, `otherMessageCount`
 - `lastUid` — highest IMAP UID seen so far
+- `lastArchiveDir` — absolute path to the most recent per-run archive (see below); preserved across runs that fetched zero new messages
 
 `previousSuccess` snapshots the prior `lastSuccess` on each successful run, so downstream consumers can ask "what landed since last run."
+
+## Archive
+
+Each successful run that fetched ≥1 new message writes a per-run directory under the state folder:
+
+    <statePath>/inbox_monitor_runs/<YYYY-MM-DD-HH-MM-SS>/
+        email-001.md
+        email-002.md
+        ...
+
+Each `email-NNN.md` is YAML frontmatter (`uid`, `from`, `subject`, `date`, `type`) followed by the message body. Body extraction prefers `text/plain`; falls back to `text/html` (kept raw) if no plain part exists. Attachments are skipped.
+
+Skipped when: there are no new messages, the run errored, `--dry-run` is set, or `--since N` was used (ad-hoc query).
 
 ## Behaviour
 

@@ -29,6 +29,7 @@ from halo import Halo
 
 
 DEFAULT_STATE_FILE_NAME = "inbox_monitor.json"
+RUNS_SUBDIR_NAME = "inbox_monitor_runs"
 
 DEFAULT_FEED_KEYWORDS = [
     "google alerts", "news", "newsletter", "substack",
@@ -190,6 +191,55 @@ def _classify(subject: str, sender: str, keywords: list[str]) -> str:
     return "other"
 
 
+def _extract_body(msg) -> str:
+    """Return the email body as text; prefer text/plain, fall back to text/html."""
+    plain_text: str | None = None
+    html_text: str | None = None
+    parts = msg.walk() if msg.is_multipart() else [msg]
+    for part in parts:
+        if part.is_multipart():
+            continue
+        if "attachment" in str(part.get("Content-Disposition", "")).lower():
+            continue
+        ctype = part.get_content_type()
+        if ctype not in ("text/plain", "text/html"):
+            continue
+        payload = part.get_payload(decode=True)
+        if not payload:
+            continue
+        charset = part.get_content_charset() or "utf-8"
+        try:
+            text = payload.decode(charset, errors="replace")
+        except (LookupError, AttributeError):
+            text = payload.decode("utf-8", errors="replace")
+        if ctype == "text/plain" and plain_text is None:
+            plain_text = text
+        elif ctype == "text/html" and html_text is None:
+            html_text = text
+    return plain_text or html_text or ""
+
+
+def _yaml_quote(value: str) -> str:
+    s = (value or "").replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{s}"'
+
+
+def _archive_messages(run_dir: Path, messages: list) -> None:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    for idx, m in enumerate(messages, start=1):
+        path = run_dir / f"email-{idx:03d}.md"
+        frontmatter = (
+            "---\n"
+            f"uid: {m['uid']}\n"
+            f"from: {_yaml_quote(m['from'])}\n"
+            f"subject: {_yaml_quote(m['subject'])}\n"
+            f"date: {_yaml_quote(m['date'])}\n"
+            f"type: {m['type']}\n"
+            "---\n\n"
+        )
+        path.write_text(frontmatter + (m.get("body") or ""), encoding="utf-8")
+
+
 def _fetch_new_messages(*, env: dict, host: str, port: int, mailbox: str,
                         scan_limit: int, last_uid: int,
                         keywords: list[str], since_date: str | None,
@@ -233,6 +283,7 @@ def _fetch_new_messages(*, env: dict, host: str, port: int, mailbox: str,
                 "subject": subject,
                 "date": date,
                 "type": _classify(subject, sender, keywords),
+                "body": _extract_body(msg),
             })
         return out, max_uid
     finally:
@@ -261,7 +312,7 @@ def _render(messages: list) -> str:
 
 
 def _build_state(prev: dict, *, messages: list, last_uid: int,
-                 error) -> dict:
+                 archive_dir: str | None, error) -> dict:
     now = _now_iso()
     feeds = sum(1 for m in messages if m["type"] == "feed")
     other = sum(1 for m in messages if m["type"] != "feed")
@@ -278,6 +329,7 @@ def _build_state(prev: dict, *, messages: list, last_uid: int,
         "feedMessageCount": feeds,
         "otherMessageCount": other,
         "lastUid": last_uid,
+        "lastArchiveDir": archive_dir or prev.get("lastArchiveDir"),
     }
     if error is None:
         state["previousSuccess"] = prev.get("lastSuccess")
@@ -356,8 +408,15 @@ def cmd_update(args) -> int:
     finally:
         spinner.stop()
 
+    archive_dir: str | None = None
+    if error is None and messages and write_state and not args.dry_run:
+        run_name = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d-%H-%M-%S")
+        run_dir = args.state.parent / RUNS_SUBDIR_NAME / run_name
+        _archive_messages(run_dir, messages)
+        archive_dir = str(run_dir)
+
     state = _build_state(prev, messages=messages, last_uid=max_uid,
-                         error=error)
+                         archive_dir=archive_dir, error=error)
 
     if not args.dry_run and write_state:
         _save_state(args.state, state)
