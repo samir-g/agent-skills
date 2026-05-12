@@ -4,6 +4,7 @@
 # dependencies = [
 #     "reader>=3.15",
 #     "markdownify>=0.11",
+#     "halo>=0.0.31",
 # ]
 # ///
 """RSS/Atom monitor CLI for AI-agent intel triage. See design doc for full spec."""
@@ -22,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
+from halo import Halo
 from markdownify import markdownify
 from reader import (
     make_reader,
@@ -30,6 +32,47 @@ from reader import (
     FeedNotFoundError,
     TagNotFoundError,
 )
+
+
+class _NullSpinner:
+    """No-op stand-in for Halo when spinners are disabled (e.g. --json, non-TTY)."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def start(self, text: str | None = None):
+        return self
+
+    def stop(self):
+        pass
+
+    @property
+    def text(self) -> str:
+        return ""
+
+    @text.setter
+    def text(self, value: str) -> None:
+        pass
+
+
+def _spinner(text: str, *, enabled: bool):
+    if not enabled or not sys.stderr.isatty():
+        return _NullSpinner()
+    return Halo(text=text, spinner="dots", stream=sys.stderr)
+
+DEFAULT_STATE_FILE_NAME = "rss_monitor.json"
+DEFAULT_DB_FILE_NAME = "rss-monitor.sqlite"
+
+EXAMPLE_CONFIG = {
+    "statePath": "~/.openclaw/workspace/state",
+    "feeds": [
+        {"url": "https://example.com/feed.xml", "tags": ["ai", "research"]},
+    ],
+    "updateScope": "all",
+}
 
 
 class UnsafeURL(ValueError):
@@ -179,7 +222,7 @@ def cmd_feed_untag(args) -> int:
     return 0
 
 
-def _update_once(args) -> tuple[dict, int]:
+def _update_once(args, *, show_progress: bool = False) -> tuple[dict, int]:
     """Run an update pass and return (payload, exit_code)."""
     with _open_reader(args) as reader:
         if args.feed:
@@ -194,31 +237,37 @@ def _update_once(args) -> tuple[dict, int]:
 
         results = []
         any_error = False
-        for url in feed_urls:
+        total = len(feed_urls)
+        for idx, url in enumerate(feed_urls, start=1):
+            spinner = _spinner(f"[{idx}/{total}] fetching {url}", enabled=show_progress)
+            spinner.start()
             try:
-                check_url(url)
-            except UnsafeURL as e:
-                any_error = True
+                try:
+                    check_url(url)
+                except UnsafeURL as e:
+                    any_error = True
+                    results.append({
+                        "url": url,
+                        "title": "",
+                        "new": 0,
+                        "error": str(e),
+                    })
+                    continue
+                before = reader.get_entry_counts(feed=url).total
+                list(reader.update_feeds_iter(feed=url))
+                after = reader.get_entry_counts(feed=url).total
+                feed = reader.get_feed(url)
+                err = str(feed.last_exception) if feed.last_exception else None
+                if err:
+                    any_error = True
                 results.append({
                     "url": url,
-                    "title": "",
-                    "new": 0,
-                    "error": str(e),
+                    "title": feed.title or "",
+                    "new": max(0, after - before),
+                    "error": err,
                 })
-                continue
-            before = reader.get_entry_counts(feed=url).total
-            list(reader.update_feeds_iter(feed=url))
-            after = reader.get_entry_counts(feed=url).total
-            feed = reader.get_feed(url)
-            err = str(feed.last_exception) if feed.last_exception else None
-            if err:
-                any_error = True
-            results.append({
-                "url": url,
-                "title": feed.title or "",
-                "new": max(0, after - before),
-                "error": err,
-            })
+            finally:
+                spinner.stop()
 
         total_new = sum(r["new"] for r in results)
         payload = {"ok": not any_error, "total_new": total_new, "feeds": results}
@@ -226,8 +275,118 @@ def _update_once(args) -> tuple[dict, int]:
     return payload, (2 if any_error else 0)
 
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def _load_state(path: Path | None) -> dict:
+    if not path or not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_state(path: Path | None, state: dict) -> None:
+    if not path:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _build_update_state(payload: dict, prev: dict, *, scope: str) -> dict:
+    """Build a state dict for an update run, mirroring notion_to_gsheet_sync."""
+    feeds = payload["feeds"]
+    total_new = payload["total_new"]
+    error_feeds = [f for f in feeds if f["error"]]
+    state: dict = {
+        "system": "RSS Monitor",
+        "lastRun": _now_iso(),
+        "lastSuccess": prev.get("lastSuccess"),
+        "lastError": "",
+        "status": "Attention",
+        "scope": scope,
+        "feedCount": len(feeds),
+        "errorFeedCount": len(error_feeds),
+        "newEntryCount": total_new,
+        "materialChange": total_new > 0,
+    }
+    if payload["ok"]:
+        state.update({
+            "lastSuccess": _now_iso(),
+            "status": "Healthy",
+            "notes": f"Updated {len(feeds)} feed(s); {total_new} new entries.",
+        })
+    else:
+        first_err = next(
+            (f"{f['url']}: {f['error']}" for f in error_feeds), "unknown error"
+        )
+        state.update({
+            "lastError": first_err,
+            "notes": (
+                f"Updated {len(feeds)} feed(s); {total_new} new entries; "
+                f"{len(error_feeds)} feed(s) failed."
+            ),
+        })
+    return state
+
+
+def _update_scope(feed: str | None, tag: str | None) -> str:
+    if feed:
+        return f"feed:{feed}"
+    if tag:
+        return f"tag:{tag}"
+    return "all"
+
+
+def _write_update_state(state_path: Path | None, payload: dict, scope: str) -> None:
+    if not state_path:
+        return
+    prev = _load_state(state_path)
+    state = _build_update_state(payload, prev, scope=scope)
+    _save_state(state_path, state)
+
+
+def _ensure_config_feeds(reader: Reader, config: dict) -> None:
+    """Add feeds declared in config (idempotently) and apply their tags.
+
+    Does not remove feeds that exist in the DB but are absent from config —
+    the config is additive, not authoritative.
+    """
+    for feed_cfg in config.get("feeds") or []:
+        if isinstance(feed_cfg, str):
+            url, tags = feed_cfg, []
+        elif isinstance(feed_cfg, dict):
+            url = feed_cfg.get("url")
+            tags = feed_cfg.get("tags") or []
+        else:
+            continue
+        if not url:
+            continue
+        try:
+            check_url(url)
+        except UnsafeURL as e:
+            sys.stderr.write(f"warning: skipping unsafe feed from config: {e}\n")
+            continue
+        try:
+            reader.add_feed(url)
+        except FeedExistsError:
+            pass
+        for tag in tags:
+            reader.set_tag(url, tag)
+
+
 def cmd_update(args) -> int:
-    payload, exit_code = _update_once(args)
+    config = getattr(args, "_config_data", {}) or {}
+    if config.get("feeds"):
+        with _open_reader(args) as reader:
+            _ensure_config_feeds(reader, config)
+
+    payload, exit_code = _update_once(args, show_progress=not args.json)
+    state_path = Path(args.state) if getattr(args, "state", None) else None
+    _write_update_state(state_path, payload, _update_scope(args.feed, args.tag))
+
     results = payload["feeds"]
     total_new = payload["total_new"]
     if args.json:
@@ -245,18 +404,30 @@ def cmd_update(args) -> int:
 
 
 def cmd_poll(args) -> int:
+    config = getattr(args, "_config_data", {}) or {}
+    if config.get("feeds"):
+        with _open_reader(args) as reader:
+            _ensure_config_feeds(reader, config)
+
     runs = 0
     last_payload = None
+    state_path = Path(args.state) if getattr(args, "state", None) else None
     update_args = argparse.Namespace(
-        db=args.db, json=True, tag=None, feed=None,
+        db=args.db, json=True,
+        tag=getattr(args, "tag", None),
+        feed=getattr(args, "feed", None),
     )
+    scope = _update_scope(update_args.feed, update_args.tag)
+    show_progress = not args.json
     while args.iterations is None or runs < args.iterations:
-        payload, _ = _update_once(update_args)
+        payload, _ = _update_once(update_args, show_progress=show_progress)
         last_payload = payload
+        _write_update_state(state_path, payload, scope)
         runs += 1
         if args.iterations is not None and runs >= args.iterations:
             break
-        time.sleep(args.interval)
+        with _spinner(f"sleeping {args.interval}s before next run", enabled=show_progress):
+            time.sleep(args.interval)
 
     result = {"ok": True, "runs": runs, "last": last_payload}
     if args.json:
@@ -494,17 +665,19 @@ def cmd_show(args) -> int:
 
 def cmd_search(args) -> int:
     with _open_reader(args) as reader:
-        reader.enable_search()
-        reader.update_search()
+        with _spinner("indexing search", enabled=not args.json):
+            reader.enable_search()
+            reader.update_search()
 
         kwargs = {}
         if args.tag:
             kwargs["feed_tags"] = [args.tag]
 
         results = []
-        for sr in reader.search_entries(args.query, **kwargs):
-            entry = reader.get_entry(sr.resource_id)
-            results.append(_entry_to_dict(reader, entry))
+        with _spinner(f"searching for {args.query!r}", enabled=not args.json):
+            for sr in reader.search_entries(args.query, **kwargs):
+                entry = reader.get_entry(sr.resource_id)
+                results.append(_entry_to_dict(reader, entry))
 
     if args.json:
         _emit(args, "", results)
@@ -565,6 +738,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="rss_monitor", description=__doc__, parents=[shared])
     p.add_argument("--db", type=Path, default=None,
                    help="Path to reader SQLite DB (default: reader's default location)")
+    p.add_argument("--config", default=None,
+                   help="Path to a JSON config file (provides defaults for --db, "
+                        "--state, declared feeds, and update scope)")
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -599,6 +775,7 @@ def build_parser() -> argparse.ArgumentParser:
     upd = sub.add_parser("update", help="Fetch new entries", parents=[shared])
     upd.add_argument("--tag", help="Only update feeds with this tag")
     upd.add_argument("--feed", help="Only update this feed URL")
+    upd.add_argument("--state", help="Write state JSON to this path after the run")
     upd.set_defaults(func=cmd_update)
 
     poll_p = sub.add_parser("poll", help="Run update repeatedly", parents=[shared])
@@ -606,7 +783,15 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Seconds between runs (default: 900)")
     poll_p.add_argument("--iterations", type=int, default=None,
                         help="Number of runs (default: forever)")
+    poll_p.add_argument("--tag", help="Only update feeds with this tag")
+    poll_p.add_argument("--feed", help="Only update this feed URL")
+    poll_p.add_argument("--state", help="Write state JSON to this path after each run")
     poll_p.set_defaults(func=cmd_poll)
+
+    ex_p = sub.add_parser("example-config",
+                          help="Print example config JSON to stdout and exit",
+                          parents=[shared])
+    ex_p.set_defaults(func=cmd_example_config)
 
     new_p = sub.add_parser("new", help="List unread entries", parents=[shared])
     new_p.add_argument("--tag", help="Filter by feed tag")
@@ -662,9 +847,74 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def cmd_example_config(args) -> int:
+    sys.stdout.write(json.dumps(EXAMPLE_CONFIG, indent=2))
+    sys.stdout.write("\n")
+    return 0
+
+
+def _load_config_file(path: Path) -> dict:
+    if not path.exists():
+        sys.stderr.write(f"error: config not found: {path}\n")
+        sys.exit(2)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        sys.stderr.write(f"error: invalid config JSON {path}: {e}\n")
+        sys.exit(2)
+    if not isinstance(data, dict):
+        sys.stderr.write(f"error: config must be a JSON object: {path}\n")
+        sys.exit(2)
+    return data
+
+
+def _resolve_state_dir(config: dict, config_path: Path) -> Path | None:
+    raw = config.get("statePath")
+    if not raw:
+        return None
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = (config_path.resolve().parent / p).resolve()
+    return p
+
+
+def _apply_config_defaults(args) -> None:
+    """If --config was given, load it and fill in defaults for db/state/scope."""
+    cfg_path_str = getattr(args, "config", None)
+    args._config_data = {}
+    if not cfg_path_str:
+        return
+    cfg_path = Path(cfg_path_str)
+    config = _load_config_file(cfg_path)
+    args._config_data = config
+
+    state_dir = _resolve_state_dir(config, cfg_path)
+
+    if not getattr(args, "db", None):
+        db_override = config.get("dbPath")
+        if db_override:
+            db_p = Path(db_override).expanduser()
+            if not db_p.is_absolute() and state_dir:
+                db_p = state_dir / db_p
+            args.db = db_p
+        elif state_dir:
+            args.db = state_dir / DEFAULT_DB_FILE_NAME
+
+    if hasattr(args, "state") and not getattr(args, "state", None) and state_dir:
+        args.state = str(state_dir / DEFAULT_STATE_FILE_NAME)
+
+    scope = config.get("updateScope")
+    if isinstance(scope, dict) and hasattr(args, "feed") and hasattr(args, "tag"):
+        if not args.feed and scope.get("feed"):
+            args.feed = scope["feed"]
+        elif not args.tag and scope.get("tag"):
+            args.tag = scope["tag"]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    _apply_config_defaults(args)
     return args.func(args)
 
 

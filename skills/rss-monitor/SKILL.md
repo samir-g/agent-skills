@@ -11,6 +11,39 @@ Run the bundled script with `uv run`:
 
 Add `--json` to any subcommand for machine-readable output. Use `--db PATH` to override the default reader database location.
 
+## Config file
+
+Pass `--config PATH` (placed before the subcommand) to drive defaults from a
+JSON config in the same shape as `notion_gsheet_sync` and
+`phantombuster-monitor`:
+
+    uv run "${CLAUDE_PLUGIN_ROOT}/skills/rss-monitor/rss_monitor.py" \
+        --config /path/to/config.json update
+
+Print a worked example:
+
+    uv run "${CLAUDE_PLUGIN_ROOT}/skills/rss-monitor/rss_monitor.py" example-config
+
+Config keys:
+
+- `statePath` — directory where state JSON and the reader DB live. Relative
+  paths are resolved against the config file's directory; `~` is expanded.
+  When set, defaults are `<statePath>/rss-monitor.sqlite` for `--db` and
+  `<statePath>/rss_monitor.json` for `--state` on `update`/`poll`.
+- `dbPath` — optional override for the DB filename or absolute path. Relative
+  paths resolve inside `statePath`.
+- `feeds` — optional list of `{url, tags}` (or bare URL strings). On
+  `update`/`poll`, each entry is added to the DB if missing and any listed
+  tags are applied. The list is additive — feeds not mentioned here are left
+  alone.
+- `updateScope` — `"all"` (default), `{"feed": "<url>"}`, or `{"tag": "<t>"}`.
+  Applied to `update`/`poll` unless `--feed`/`--tag` is given explicitly.
+
+CLI flags always win over config values.
+
+`runner.sh` is a thin wrapper that calls `rss_monitor.py --config config.json
+update` (default) or `... poll [flags...]`.
+
 ## Feed management
 
 - `feed add <url> [--tag T ...]` — add a feed (rejects private/internal URLs).
@@ -20,8 +53,16 @@ Add `--json` to any subcommand for machine-readable output. Use `--db PATH` to o
 
 ## Updating
 
-- `update [--feed URL] [--tag T]` — fetch new entries.
-- `poll [--interval SEC] [--iterations N]` — run update repeatedly.
+- `update [--feed URL] [--tag T] [--state PATH]` — fetch new entries.
+- `poll [--feed URL] [--tag T] [--interval SEC] [--iterations N] [--state PATH]` — run update repeatedly.
+
+`--state PATH` writes a JSON status file after each run, aligned with the
+`notion_gsheet_sync` and `phantombuster-monitor` state shape: `system`,
+`lastRun`, `lastSuccess`, `lastError`, `status` (`Healthy`/`Attention`),
+`materialChange`, `notes`, plus RSS-specific `scope`, `feedCount`,
+`errorFeedCount`, `newEntryCount`. `lastSuccess` is preserved from the prior
+state when a run fails. When `--config` provides a `statePath`, the state
+file defaults to `<statePath>/rss_monitor.json`.
 
 ## Reading
 
